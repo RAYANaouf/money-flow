@@ -7,14 +7,91 @@ import pandas as pd
 import json
 from datetime import date
 from dateutil.relativedelta import relativedelta
+import altair as alt
+import numpy as np
 
 # Optional charts
 try:
-    import altair as alt
+    import pydeck as pdk  # noqa
 except Exception:
-    alt = None
+    pdk = None  # will import inside Map screen
 
 st.set_page_config(page_title="ERPNext Dashboard", layout="wide")
+
+st.markdown("""
+<style>
+    /* Main page styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    
+    /* Card styling */
+    .card {
+        background: white;
+        border-radius: 10px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        margin-bottom: 1.5rem;
+    }
+    
+    /* Metric styling */
+    .metric-card {
+        background: linear-gradient(145deg, #f8f9fa 0%, #fff 100%);
+        border-radius: 10px;
+        padding: 1.25rem;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        transition: transform 0.2s;
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-3px);
+    }
+    
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #2563eb;
+        margin: 0.5rem 0;
+    }
+    
+    .metric-label {
+        font-size: 0.9rem;
+        color: #6b7280;
+        margin: 0;
+    }
+    
+    /* Chart containers */
+    .chart-container {
+        background: white;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 10px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: #c1c1c1;
+        border-radius: 10px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: #a1a1a1;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ---------- Secrets ----------
 BASE = st.secrets["erpnext"]["base_url"].rstrip("/")
@@ -178,7 +255,12 @@ def list_customers():
     df = pd.DataFrame(all_rows)
     if df.empty:
         return df
-    df["display_customer"] = df.get("customer_name").fillna(df.get("name"))
+
+    # Robust display name fallback
+    disp = df.get("customer_name").fillna("")
+    disp = disp.replace("", np.nan)
+    df["display_customer"] = disp.fillna(df.get("name"))
+
     df["custom_lat"] = pd.to_numeric(df.get("custom_lat"), errors="coerce")
     df["custom_lon"] = pd.to_numeric(df.get("custom_lon"), errors="coerce")
     return df
@@ -331,12 +413,13 @@ def download_button(df: pd.DataFrame, filename: str, label: str):
 
 # ---------- Screens ----------
 if run and st.session_state.nav == "TTC":
-    st.subheader("TTC by Date (per company)")
+    st.subheader("💰 Revenue Analytics")
     try:
         inv = fetch_invoices(selected_companies, start_date, end_date, include_drafts, user_key=st.session_state.user or "")
         if inv.empty:
             st.info("No invoices found."); st.stop()
 
+        # Create daily data
         all_daily = []
         for co, df_co in inv.groupby("company"):
             d = (
@@ -349,47 +432,146 @@ if run and st.session_state.nav == "TTC":
             all_daily.append(d)
         daily_df = pd.concat(all_daily, ignore_index=True)
 
+        # Metrics
         total_ttc = float(inv["TTC"].sum())
         inv_count = len(inv)
-        c1, c2 = st.columns(2)
-        c1.metric("Total TTC (company currency)", f"{total_ttc:,.2f}")
-        c2.metric("Invoices", f"{inv_count:,}")
+        avg_invoice = total_ttc / inv_count if inv_count > 0 else 0
+        
+        # Create metric cards
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <p class="metric-label">Total Revenue</p>
+                <p class="metric-value">{total_ttc:,.2f}</p>
+                <p class="metric-label">across {inv_count:,} invoices</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <p class="metric-label">Avg. Invoice</p>
+                <p class="metric-value">{avg_invoice:,.2f}</p>
+                <p class="metric-label">per transaction</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <p class="metric-label">Date Range</p>
+                <p class="metric-value">{len(daily_df['date'].dt.date.unique())} days</p>
+                <p class="metric-label">{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}</p>
+            </div>
+            """, unsafe_allow_html=True)
 
-        if alt:
-            chart = (
-                alt.Chart(daily_df)
-                .mark_line()
-                .encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("TTC:Q", title="TTC"),
-                    color=alt.Color("company:N", title="Company"),
-                    tooltip=["company:N","date:T","TTC:Q"]
-                )
-                .properties(height=380)
-                .interactive()
+        # Revenue Trends Chart
+        st.markdown("### Revenue Trends")
+        chart = alt.Chart(daily_df).mark_area(
+            interpolate='monotone',
+            line={'color':'#4C78A8'},
+            color=alt.Gradient(
+                gradient='linear',
+                stops=[
+                    alt.GradientStop(color='white', offset=0),
+                    alt.GradientStop(color='#4C78A8', offset=1)
+                ],
+                x1=1, x2=1, y1=1, y2=0
             )
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            wide = daily_df.pivot(index="date", columns="company", values="TTC").fillna(0)
-            st.line_chart(wide)
-
-        with st.expander("Daily totals"):
-            st.dataframe(daily_df.sort_values(["date","company"]), use_container_width=True)
-            download_button(daily_df, "ttc_daily.csv", "Download daily TTC CSV")
-
-        with st.expander("Invoice rows"):
-            st.dataframe(inv[["name","posting_date","company","customer","base_grand_total","currency"]], use_container_width=True)
-            download_button(inv, "ttc_invoices.csv", "Download invoices CSV")
+        ).encode(
+            x=alt.X('date:T', title='Date', axis=alt.Axis(format='%b %Y')),
+            y=alt.Y('sum(TTC):Q', title='Revenue'),
+            color=alt.Color('company:N', title='Company', scale=alt.Scale(scheme='tableau20')),
+            tooltip=[
+                alt.Tooltip('date:T', title='Date', format='%b %d, %Y'),
+                alt.Tooltip('company:N', title='Company'),
+                alt.Tooltip('sum(TTC):Q', title='Revenue', format=',.2f')
+            ]
+        ).properties(
+            height=400,
+            title='Daily Revenue by Company'
+        ).interactive()
+        
+        st.altair_chart(chart, use_container_width=True)
+        
+        # Monthly Breakdown
+        st.markdown("### Monthly Breakdown")
+        monthly_df = daily_df.copy()
+        monthly_df['month'] = monthly_df['date'].dt.strftime('%Y-%m')
+        
+        monthly_chart = alt.Chart(monthly_df).mark_bar(
+            cornerRadiusTopLeft=3,
+            cornerRadiusTopRight=3
+        ).encode(
+            x=alt.X('month:O', title='Month', sort='x'),
+            y=alt.Y('sum(TTC):Q', title='Revenue'),
+            color=alt.Color('company:N', title='Company', scale=alt.Scale(scheme='tableau20')),
+            tooltip=[
+                alt.Tooltip('month:O', title='Month'),
+                alt.Tooltip('company:N', title='Company'),
+                alt.Tooltip('sum(TTC):Q', title='Revenue', format=',.2f')
+            ]
+        ).properties(
+            height=400,
+            title='Monthly Revenue by Company'
+        )
+        
+        st.altair_chart(monthly_chart, use_container_width=True)
+        
+        # Top Customers
+        st.markdown("### Top Customers")
+        top_customers = inv.groupby('customer')['TTC'].sum().nlargest(10).reset_index()
+        
+        customer_chart = alt.Chart(top_customers).mark_bar(
+            cornerRadiusTopRight=3,
+            cornerRadiusBottomRight=3
+        ).encode(
+            x=alt.X('sum(TTC):Q', title='Revenue'),
+            y=alt.Y('customer:N', title='', sort='-x'),
+            color=alt.Color('sum(TTC):Q', scale=alt.Scale(scheme='blues'), legend=None),
+            tooltip=[
+                alt.Tooltip('customer:N', title='Customer'),
+                alt.Tooltip('sum(TTC):Q', title='Revenue', format=',.2f')
+            ]
+        ).properties(
+            height=400,
+            title='Top 10 Customers by Revenue'
+        )
+        
+        st.altair_chart(customer_chart, use_container_width=True)
+        
+        # Data tables in expanders
+        with st.expander("📊 View Detailed Data"):
+            tab1, tab2 = st.tabs(["Daily Totals", "Invoice Details"])
+            
+            with tab1:
+                st.dataframe(
+                    daily_df.sort_values(["date", "company"]), 
+                    use_container_width=True,
+                    height=400
+                )
+                download_button(daily_df, "ttc_daily.csv", "📥 Download Daily Data")
+                
+            with tab2:
+                st.dataframe(
+                    inv[["name", "posting_date", "company", "customer", "base_grand_total", "currency"]],
+                    use_container_width=True,
+                    height=400
+                )
+                download_button(inv, "ttc_invoices.csv", "📥 Download Invoice Data")
 
     except requests.HTTPError as e:
-        st.error("ERPNext API error.")
-        try: st.code(e.response.text)
-        except Exception: st.write(e)
+        st.error("❌ ERPNext API error.")
+        try: 
+            st.code(e.response.text)
+        except Exception: 
+            st.write(e)
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"❌ Error: {e}")
 
 elif run and st.session_state.nav == "Debts":
-    st.subheader("Accounts Receivable (Open Debts)")
+    st.subheader("💳  Debts (A/R)")
     try:
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
         if open_inv.empty:
@@ -445,7 +627,7 @@ elif run and st.session_state.nav == "Debts":
         st.error(f"Error: {e}")
 
 elif run and st.session_state.nav == "Customers":
-    st.subheader("Customers Overview")
+    st.subheader("👥  Customers Overview")
     try:
         inv_period = fetch_invoices(selected_companies, start_date, end_date, include_drafts=False, user_key=st.session_state.user or "")
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
@@ -518,8 +700,17 @@ elif run and st.session_state.nav == "Customers":
         st.error(f"Error: {e}")
 
 elif run and st.session_state.nav == "Map":
-    st.subheader("Clients Sales Map (from Customer.custom_lat/custom_lon only)")
+    st.subheader("🗺️  Clients Sales Map (from Customer.custom_lat/custom_lon only)")
     st.caption("Blue = customers who bought in the selected period; Gray = customers who did not.")
+
+    # ---- Small UI controls for size/readability ----
+    colz1, colz2, colz3 = st.columns([1,1,1])
+    with colz1:
+        sold_px = st.slider("Sold point size (px)", 2, 16, 6)
+    with colz2:
+        idle_px = st.slider("No-sale point size (px)", 2, 16, 5)
+    with colz3:
+        jitter_on = st.toggle("Anti-overlap jitter", value=True, help="Adds tiny random offsets so nearby customers don't overlap.")
 
     try:
         # Buyers in selected period (coloring only)
@@ -537,17 +728,26 @@ elif run and st.session_state.nav == "Map":
             st.info("No customers found."); st.stop()
 
         data = cust_df.copy()
-        data["status"] = data["name"].apply(lambda c: "Sold (period)" if c in buyers_period else "No sale in period")
+        data["status"] = np.where(data["name"].isin(buyers_period), "Sold (period)", "No sale in period")
         data.rename(columns={"display_customer": "customer"}, inplace=True)
 
         # Keep only rows with valid coordinates
         plot_df = data.dropna(subset=["custom_lat", "custom_lon"]).copy()
-        plot_df["lat"] = plot_df["custom_lat"]
-        plot_df["lon"] = plot_df["custom_lon"]
-
         if plot_df.empty:
             st.warning("No customers have coordinates (custom_lat/custom_lon). Add them on Customer records.")
             st.stop()
+
+        # Optional: tiny deterministic jitter (so close points don't fully overlap)
+        if jitter_on:
+            # jitter size ~ a few meters; ~1e-5 deg ≈ 1.1 m
+            def dj(seed):
+                h = abs(hash(str(seed))) % 10_000
+                return (h / 10_000.0 - 0.5) * 0.00005  # ~±0.000025 deg ≈ ±2–3 m
+            plot_df["lat"] = plot_df["custom_lat"] + plot_df["name"].map(dj)
+            plot_df["lon"] = plot_df["custom_lon"] + plot_df["name"].map(lambda x: dj(str(x)+"x"))
+        else:
+            plot_df["lat"] = plot_df["custom_lat"]
+            plot_df["lon"] = plot_df["custom_lon"]
 
         # KPIs
         sold_n = int((plot_df["status"] == "Sold (period)").sum())
@@ -564,12 +764,18 @@ elif run and st.session_state.nav == "Map":
         sold_df = plot_df[plot_df["status"] == "Sold (period)"]
         idle_df = plot_df[plot_df["status"] == "No sale in period"]
 
+        # Use pixel-based radii so size is consistent at any zoom
         layer_sold = pdk.Layer(
             "ScatterplotLayer",
             data=sold_df,
             get_position='[lon, lat]',
-            get_radius=9000,
-            radius_min_pixels=4,
+            get_radius=sold_px,
+            radius_units="pixels",
+            radius_min_pixels=sold_px,
+            radius_max_pixels=sold_px,
+            stroked=True,
+            get_line_color=[255, 255, 255, 220],
+            line_width_min_pixels=1,
             pickable=True,
             get_fill_color=[0, 140, 255, 200],
         )
@@ -577,11 +783,17 @@ elif run and st.session_state.nav == "Map":
             "ScatterplotLayer",
             data=idle_df,
             get_position='[lon, lat]',
-            get_radius=7000,
-            radius_min_pixels=3,
+            get_radius=idle_px,
+            radius_units="pixels",
+            radius_min_pixels=idle_px,
+            radius_max_pixels=idle_px,
+            stroked=True,
+            get_line_color=[255, 255, 255, 200],
+            line_width_min_pixels=1,
             pickable=True,
             get_fill_color=[160, 160, 160, 160],
         )
+
         view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=5.2)
         tooltip = {"text": "{customer}\nStatus: {status}"}
 
