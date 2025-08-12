@@ -1,5 +1,6 @@
-# Streamlit + ERPNext multi-screen: TTC, Debts (A/R), Customers
-# Sidebar buttons navigation (single box per item, no page refresh)
+# ERPNext Dashboard: TTC, Debts (A/R), Customers, Map
+# Map uses ONLY Customer.custom_lat/custom_lon (no Address fallback)
+
 import streamlit as st
 import requests
 import pandas as pd
@@ -7,7 +8,7 @@ import json
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
-# Optional nicer charts (fallback to st.* if missing)
+# Optional charts
 try:
     import altair as alt
 except Exception:
@@ -15,10 +16,20 @@ except Exception:
 
 st.set_page_config(page_title="ERPNext Dashboard", layout="wide")
 
+# ---------- Secrets ----------
 BASE = st.secrets["erpnext"]["base_url"].rstrip("/")
 VERIFY_SSL = st.secrets["erpnext"].get("verify_ssl", True)
+MAPBOX_TOKEN = st.secrets.get("mapbox", {}).get("token", "")
 
-# ---------------- Session State ----------------
+# ---------- Optional map token for pydeck ----------
+try:
+    import pydeck as pdk  # noqa
+    if MAPBOX_TOKEN:
+        pdk.settings.mapbox_api_key = MAPBOX_TOKEN
+except Exception:
+    pdk = None  # will import inside Map screen
+
+# ---------- Session State ----------
 if "cookies" not in st.session_state:
     st.session_state.cookies = None
 if "user" not in st.session_state:
@@ -26,9 +37,9 @@ if "user" not in st.session_state:
 if "date_range" not in st.session_state:
     st.session_state.date_range = (date.today() - relativedelta(months=3), date.today())
 if "nav" not in st.session_state:
-    st.session_state.nav = "TTC"  # default
+    st.session_state.nav = "TTC"
 
-# ---------------- HTTP helpers ----------------
+# ---------- HTTP helpers ----------
 def new_session() -> requests.Session:
     s = requests.Session()
     if st.session_state.cookies:
@@ -68,13 +79,13 @@ def api_get(path: str, **params):
     r.raise_for_status()
     return r.json()["data"]
 
-# ---------------- Data Fetchers ----------------
+# ---------- Data Fetchers ----------
 @st.cache_data(show_spinner=False)
 def list_companies(user_key: str):
     data = api_get("/api/resource/Company", fields=json.dumps(["name"]), order_by="name asc", limit_page_length=1000)
     return [row["name"] for row in data]
 
-# NOTE: do NOT request base_outstanding_amount (blocked in list API)
+# Do NOT request base_outstanding_amount (forbidden in list API)
 BASE_FIELDS = [
     "name", "posting_date", "company", "customer", "due_date",
     "base_grand_total", "grand_total", "currency",
@@ -123,13 +134,11 @@ def fetch_invoices(
     if df.empty:
         return df
 
-    # Types
     if "posting_date" in df.columns:
         df["posting_date"] = pd.to_datetime(df["posting_date"])
     if "due_date" in df.columns:
         df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
 
-    # Convenience (company currency totals + computed base_outstanding)
     df["TTC"] = df.get("base_grand_total", 0)
     df["conversion_rate"] = pd.to_numeric(df.get("conversion_rate", 1), errors="coerce").fillna(1.0)
     df["outstanding_amount"] = pd.to_numeric(df.get("outstanding_amount", 0), errors="coerce").fillna(0.0)
@@ -139,7 +148,6 @@ def fetch_invoices(
 
 @st.cache_data(show_spinner=True)
 def fetch_outstanding_invoices(companies, user_key: str=""):
-    # All open AR, regardless of date
     return fetch_invoices(
         companies=companies,
         start=None, end=None,
@@ -149,7 +157,33 @@ def fetch_outstanding_invoices(companies, user_key: str=""):
         user_key=user_key
     )
 
-# ---------------- UI: Login ----------------
+# Customers (includes ONLY custom_lat/custom_lon)
+@st.cache_data(show_spinner=True)
+def list_customers():
+    fields = ["name", "customer_name", "mobile_no", "territory", "custom_lat", "custom_lon"]
+    all_rows = []
+    start_idx = 0
+    while True:
+        page = api_get(
+            "/api/resource/Customer",
+            fields=json.dumps(fields),
+            order_by="name asc",
+            limit_page_length=5000,
+            limit_start=start_idx
+        )
+        all_rows.extend(page)
+        if len(page) < 5000:
+            break
+        start_idx += 5000
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+    df["display_customer"] = df.get("customer_name").fillna(df.get("name"))
+    df["custom_lat"] = pd.to_numeric(df.get("custom_lat"), errors="coerce")
+    df["custom_lon"] = pd.to_numeric(df.get("custom_lon"), errors="coerce")
+    return df
+
+# ---------- UI: Login ----------
 st.title("ERPNext Dashboard")
 if not st.session_state.user:
     st.subheader("Log in to ERPNext")
@@ -169,13 +203,12 @@ if st.button("Logout"):
     logout()
     st.rerun()
 
-st.caption(f"Active screen: {st.session_state.nav}")
-
-# ---------------- Sidebar: NAV (single-box buttons) + Filters ----------------
+# ---------- Sidebar: NAV (buttons) + Filters ----------
 SIDEBAR_CSS = """
 <style>
 .sidebar-nav { display: flex; flex-direction: column; gap: .6rem; margin-bottom: .75rem; }
-.nav-btn .stButton > button {
+
+.sidebar-nav .stButton > button {
   width: 100%;
   display: flex; align-items: center; gap: .6rem;
   padding: .55rem .75rem;
@@ -183,52 +216,77 @@ SIDEBAR_CSS = """
   border: 1px solid rgba(200,200,200,.25);
   background: rgba(255,255,255,.02);
   font-weight: 600;
-  position: relative;  /* allow indicator pseudo-elements */
+  position: relative;
   transition: transform .12s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
 }
-.nav-btn .stButton > button:hover { background: rgba(255,255,255,.06); border-color: rgba(180,180,255,.45); }
+.sidebar-nav .stButton > button:hover { background: rgba(255,255,255,.06); border-color: rgba(180,180,255,.45); }
 
-.nav-btn.active .stButton > button {
-  border-color: rgba(90,120,255,.65);
-  box-shadow: 0 0 0 2px rgba(90,120,255,.15) inset, 0 0 12px rgba(90,120,255,.18);
-  background: linear-gradient(180deg, rgba(90,120,255,.12), rgba(90,120,255,.06));
-  transform: translateZ(0) scale(1.01);
-}
-/* LEFT accent bar on active */
-.nav-btn.active .stButton > button:before {
-  content: "";
-  position: absolute; left: 6px; top: 8px; bottom: 8px; width: 4px;
-  border-radius: 6px;
-  background: linear-gradient(180deg, rgba(90,120,255,1), rgba(90,120,255,.55));
-  box-shadow: 0 0 10px rgba(90,120,255,.55);
-}
-/* Glowing dot on the right */
-.nav-btn.active .stButton > button:after {
-  content: "";
-  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
-  width: 8px; height: 8px; border-radius: 9999px;
-  background: rgba(90,120,255,.95);
-  box-shadow: 0 0 10px rgba(90,120,255,.8), 0 0 18px rgba(90,120,255,.45);
+@keyframes glowPulse {
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px rgba(90,120,255,.18) inset,
+      0 0 14px rgba(90,120,255,.30),
+      0 0 0 rgba(90,120,255,0);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgba(90,120,255,.22) inset,
+      0 0 26px rgba(90,120,255,.60),
+      0 0 24px rgba(90,120,255,.30);
+  }
 }
 </style>
 """
-
 st.sidebar.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
 def sidebar_nav_buttons():
-    items = [
-        ("TTC", "📈", "nav_ttc_btn"),
-        ("Debts", "💳", "nav_debts_btn"),
-        ("Customers", "👥", "nav_customers_btn"),
-    ]
     st.sidebar.markdown('<div class="sidebar-nav">', unsafe_allow_html=True)
-    for name, icon, key in items:
-        active = (st.session_state.nav == name)
-        st.sidebar.markdown(f'<div class="nav-btn {"active" if active else ""}">', unsafe_allow_html=True)
-        if st.sidebar.button(f"{icon}  {name}", key=key, use_container_width=True):
-            st.session_state.nav = name
-            st.rerun()
-        st.sidebar.markdown('</div>', unsafe_allow_html=True)
+
+    b1 = st.sidebar.button("📈  TTC", key="nav_ttc_btn", use_container_width=True)
+    b2 = st.sidebar.button("💳  Debts", key="nav_debts_btn", use_container_width=True)
+    b3 = st.sidebar.button("👥  Customers", key="nav_customers_btn", use_container_width=True)
+    b4 = st.sidebar.button("🗺️  Map", key="nav_map_btn", use_container_width=True)
+
+    if b1:
+        st.session_state.nav = "TTC"; st.rerun()
+    if b2:
+        st.session_state.nav = "Debts"; st.rerun()
+    if b3:
+        st.session_state.nav = "Customers"; st.rerun()
+    if b4:
+        st.session_state.nav = "Map"; st.rerun()
+
+    active_idx = {"TTC": 1, "Debts": 2, "Customers": 3, "Map": 4}[st.session_state.nav]
+
+    st.sidebar.markdown(f"""
+    <style>
+    .sidebar-nav .stButton:nth-of-type({active_idx}) > button {{
+      border-color: rgba(90,120,255,.65) !important;
+      background: linear-gradient(180deg, rgba(90,120,255,.12), rgba(90,120,255,.06)) !important;
+      transform: translateZ(0) scale(1.01);
+      animation: glowPulse 1.6s ease-in-out infinite;
+      box-shadow:
+        0 0 0 2px rgba(90,120,255,.18) inset,
+        0 0 18px rgba(90,120,255,.45),
+        0 0 36px rgba(90,120,255,.25);
+    }}
+    .sidebar-nav .stButton:nth-of-type({active_idx}) > button:before {{
+      content: "";
+      position: absolute; left: 6px; top: 8px; bottom: 8px; width: 4px;
+      border-radius: 6px;
+      background: linear-gradient(180deg, rgba(90,120,255,1), rgba(90,120,255,.55));
+      box-shadow: 0 0 10px rgba(90,120,255,.55);
+    }}
+    .sidebar-nav .stButton:nth-of-type({active_idx}) > button:after {{
+      content: "";
+      position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+      width: 8px; height: 8px; border-radius: 9999px;
+      background: rgba(90,120,255,.95);
+      box-shadow: 0 0 10px rgba(90,120,255,.8), 0 0 18px rgba(90,120,255,.45);
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
 with st.sidebar:
@@ -236,7 +294,6 @@ with st.sidebar:
     sidebar_nav_buttons()
 
     st.header("Filters")
-    # Companies
     try:
         companies = list_companies(st.session_state.user or "")
     except Exception as e:
@@ -253,9 +310,7 @@ with st.sidebar:
     else:
         selected_companies = [c for c in selected if c in companies]
 
-    # Date range (stable)
     start_date, end_date = st.date_input("Date range", value=st.session_state.date_range, key="date_range")
-    # In some Streamlit versions, date_input may return a tuple:
     if isinstance(start_date, tuple):
         start_date, end_date = start_date[0], start_date[1]
     if not isinstance(start_date, date) or not isinstance(end_date, date):
@@ -265,26 +320,23 @@ with st.sidebar:
         start_date, end_date = end_date, start_date
 
     include_drafts = st.toggle("Include Draft Invoices (for TTC only)", value=False, key="include_drafts")
-
     run = st.button("Load data")
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 def download_button(df: pd.DataFrame, filename: str, label: str):
     if df.empty:
         return
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
-# ---------------- Screens ----------------
+# ---------- Screens ----------
 if run and st.session_state.nav == "TTC":
     st.subheader("TTC by Date (per company)")
     try:
         inv = fetch_invoices(selected_companies, start_date, end_date, include_drafts, user_key=st.session_state.user or "")
         if inv.empty:
-            st.info("No invoices found.")
-            st.stop()
+            st.info("No invoices found."); st.stop()
 
-        # Daily per company
         all_daily = []
         for co, df_co in inv.groupby("company"):
             d = (
@@ -297,14 +349,12 @@ if run and st.session_state.nav == "TTC":
             all_daily.append(d)
         daily_df = pd.concat(all_daily, ignore_index=True)
 
-        # KPIs
         total_ttc = float(inv["TTC"].sum())
         inv_count = len(inv)
         c1, c2 = st.columns(2)
         c1.metric("Total TTC (company currency)", f"{total_ttc:,.2f}")
         c2.metric("Invoices", f"{inv_count:,}")
 
-        # Chart
         if alt:
             chart = (
                 alt.Chart(daily_df)
@@ -333,10 +383,8 @@ if run and st.session_state.nav == "TTC":
 
     except requests.HTTPError as e:
         st.error("ERPNext API error.")
-        try:
-            st.code(e.response.text)
-        except Exception:
-            st.write(e)
+        try: st.code(e.response.text)
+        except Exception: st.write(e)
     except Exception as e:
         st.error(f"Error: {e}")
 
@@ -345,10 +393,8 @@ elif run and st.session_state.nav == "Debts":
     try:
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
         if open_inv.empty:
-            st.info("No open debts found.")
-            st.stop()
+            st.info("No open debts found."); st.stop()
 
-        # Aging
         today = pd.Timestamp(date.today())
         open_inv["days_overdue"] = (today - open_inv["due_date"]).dt.days
         open_inv["days_overdue"] = open_inv["days_overdue"].fillna(0).astype(int)
@@ -359,7 +405,6 @@ elif run and st.session_state.nav == "Debts":
         c1.metric("Total Outstanding (company currency)", f"{total_outstanding:,.2f}")
         c2.metric("Open Invoices", f"{count_open:,}")
 
-        # Per-customer outstanding
         per_cust = (
             open_inv.groupby(["company","customer"], as_index=False)
                     .agg(Outstanding=("base_outstanding","sum"),
@@ -368,7 +413,7 @@ elif run and st.session_state.nav == "Debts":
                     .sort_values(["Outstanding"], ascending=False)
         )
 
-        st.markdown("**Top customers by outstanding**")
+        st.markdown("Top customers by outstanding")
         topN = per_cust.nlargest(15, "Outstanding")
         if alt and not topN.empty:
             chart = (
@@ -386,10 +431,6 @@ elif run and st.session_state.nav == "Debts":
         elif not topN.empty:
             st.bar_chart(topN.set_index("customer")["Outstanding"])
 
-        with st.expander("Per-customer table"):
-            st.dataframe(per_cust, use_container_width=True)
-            download_button(per_cust, "debts_per_customer.csv", "Download per-customer CSV")
-
         cols = ["name","posting_date","due_date","company","customer","base_outstanding","currency","status","days_overdue","outstanding_amount","conversion_rate"]
         cols = [c for c in cols if c in open_inv.columns]
         with st.expander("Open invoice rows"):
@@ -398,10 +439,8 @@ elif run and st.session_state.nav == "Debts":
 
     except requests.HTTPError as e:
         st.error("ERPNext API error.")
-        try:
-            st.code(e.response.text)
-        except Exception:
-            st.write(e)
+        try: st.code(e.response.text)
+        except Exception: st.write(e)
     except Exception as e:
         st.error(f"Error: {e}")
 
@@ -412,8 +451,7 @@ elif run and st.session_state.nav == "Customers":
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
 
         if inv_period.empty and open_inv.empty:
-            st.info("No data for the selected filters.")
-            st.stop()
+            st.info("No data for the selected filters."); st.stop()
 
         if not inv_period.empty:
             agg_period = (
@@ -455,7 +493,7 @@ elif run and st.session_state.nav == "Customers":
         download_button(customers, "customers_overview.csv", "Download customers CSV")
 
         topC = customers.nlargest(20, "Sales_TTC")
-        st.markdown("**Top customers by sales (period)**")
+        st.markdown("Top customers by sales (period)")
         if alt and not topC.empty:
             chart = (
                 alt.Chart(topC)
@@ -474,9 +512,92 @@ elif run and st.session_state.nav == "Customers":
 
     except requests.HTTPError as e:
         st.error("ERPNext API error.")
-        try:
-            st.code(e.response.text)
-        except Exception:
-            st.write(e)
+        try: st.code(e.response.text)
+        except Exception: st.write(e)
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+elif run and st.session_state.nav == "Map":
+    st.subheader("Clients Sales Map (from Customer.custom_lat/custom_lon only)")
+    st.caption("Blue = customers who bought in the selected period; Gray = customers who did not.")
+
+    try:
+        # Buyers in selected period (coloring only)
+        inv_period = fetch_invoices(
+            selected_companies, start_date, end_date,
+            include_drafts=False,
+            fields_add=[],
+            user_key=st.session_state.user or ""
+        )
+        buyers_period = set(inv_period["customer"].dropna()) if not inv_period.empty else set()
+
+        # All customers with coords
+        cust_df = list_customers()
+        if cust_df.empty:
+            st.info("No customers found."); st.stop()
+
+        data = cust_df.copy()
+        data["status"] = data["name"].apply(lambda c: "Sold (period)" if c in buyers_period else "No sale in period")
+        data.rename(columns={"display_customer": "customer"}, inplace=True)
+
+        # Keep only rows with valid coordinates
+        plot_df = data.dropna(subset=["custom_lat", "custom_lon"]).copy()
+        plot_df["lat"] = plot_df["custom_lat"]
+        plot_df["lon"] = plot_df["custom_lon"]
+
+        if plot_df.empty:
+            st.warning("No customers have coordinates (custom_lat/custom_lon). Add them on Customer records.")
+            st.stop()
+
+        # KPIs
+        sold_n = int((plot_df["status"] == "Sold (period)").sum())
+        nosale_n = int((plot_df["status"] == "No sale in period").sum())
+        c1, c2 = st.columns(2)
+        c1.metric("Customers with sales (period)", f"{sold_n:,}")
+        c2.metric("Customers with no sales (period)", f"{nosale_n:,}")
+
+        # Map
+        import pydeck as pdk
+        center_lat = float(plot_df["lat"].mean())
+        center_lon = float(plot_df["lon"].mean())
+
+        sold_df = plot_df[plot_df["status"] == "Sold (period)"]
+        idle_df = plot_df[plot_df["status"] == "No sale in period"]
+
+        layer_sold = pdk.Layer(
+            "ScatterplotLayer",
+            data=sold_df,
+            get_position='[lon, lat]',
+            get_radius=9000,
+            radius_min_pixels=4,
+            pickable=True,
+            get_fill_color=[0, 140, 255, 200],
+        )
+        layer_idle = pdk.Layer(
+            "ScatterplotLayer",
+            data=idle_df,
+            get_position='[lon, lat]',
+            get_radius=7000,
+            radius_min_pixels=3,
+            pickable=True,
+            get_fill_color=[160, 160, 160, 160],
+        )
+        view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=5.2)
+        tooltip = {"text": "{customer}\nStatus: {status}"}
+
+        deck = pdk.Deck(layers=[layer_idle, layer_sold], initial_view_state=view, tooltip=tooltip)
+        if MAPBOX_TOKEN:
+            deck.map_style = "mapbox://styles/mapbox/light-v9"
+        st.pydeck_chart(deck, use_container_width=True)
+
+        with st.expander("Mapped customers (table)"):
+            show_cols = ["customer","status","custom_lat","custom_lon"]
+            st.dataframe(plot_df[show_cols].sort_values(["status","customer"]), use_container_width=True)
+            download_button(plot_df[show_cols], "customers_map.csv", "Download CSV")
+
+    except requests.HTTPError as e:
+        st.error("ERPNext API error.")
+        try: st.code(e.response.text)
+        except Exception: st.write(e)
     except Exception as e:
         st.error(f"Error: {e}")
