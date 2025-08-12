@@ -169,6 +169,8 @@ if st.button("Logout"):
     logout()
     st.rerun()
 
+st.caption(f"Active screen: {st.session_state.nav}")
+
 # ---------------- Sidebar: NAV (single-box buttons) + Filters ----------------
 SIDEBAR_CSS = """
 <style>
@@ -181,17 +183,36 @@ SIDEBAR_CSS = """
   border: 1px solid rgba(200,200,200,.25);
   background: rgba(255,255,255,.02);
   font-weight: 600;
+  position: relative;  /* allow indicator pseudo-elements */
   transition: transform .12s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
 }
 .nav-btn .stButton > button:hover { background: rgba(255,255,255,.06); border-color: rgba(180,180,255,.45); }
+
 .nav-btn.active .stButton > button {
   border-color: rgba(90,120,255,.65);
   box-shadow: 0 0 0 2px rgba(90,120,255,.15) inset, 0 0 12px rgba(90,120,255,.18);
   background: linear-gradient(180deg, rgba(90,120,255,.12), rgba(90,120,255,.06));
   transform: translateZ(0) scale(1.01);
 }
+/* LEFT accent bar on active */
+.nav-btn.active .stButton > button:before {
+  content: "";
+  position: absolute; left: 6px; top: 8px; bottom: 8px; width: 4px;
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(90,120,255,1), rgba(90,120,255,.55));
+  box-shadow: 0 0 10px rgba(90,120,255,.55);
+}
+/* Glowing dot on the right */
+.nav-btn.active .stButton > button:after {
+  content: "";
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  width: 8px; height: 8px; border-radius: 9999px;
+  background: rgba(90,120,255,.95);
+  box-shadow: 0 0 10px rgba(90,120,255,.8), 0 0 18px rgba(90,120,255,.45);
+}
 </style>
 """
+
 st.sidebar.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
 def sidebar_nav_buttons():
