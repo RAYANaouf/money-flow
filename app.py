@@ -1,9 +1,9 @@
 # Streamlit + ERPNext multi-screen: TTC, Debts (A/R), Customers
+# Sidebar buttons navigation (single box per item, no page refresh)
 import streamlit as st
 import requests
 import pandas as pd
 import json
-from io import StringIO
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
@@ -26,8 +26,9 @@ if "user" not in st.session_state:
 if "date_range" not in st.session_state:
     st.session_state.date_range = (date.today() - relativedelta(months=3), date.today())
 if "nav" not in st.session_state:
-    st.session_state.nav = "TTC"
+    st.session_state.nav = "TTC"  # default
 
+# ---------------- HTTP helpers ----------------
 def new_session() -> requests.Session:
     s = requests.Session()
     if st.session_state.cookies:
@@ -77,15 +78,19 @@ def list_companies(user_key: str):
 BASE_FIELDS = [
     "name", "posting_date", "company", "customer", "due_date",
     "base_grand_total", "grand_total", "currency",
-    "outstanding_amount", "status", "conversion_rate"
+    "outstanding_amount", "status", "conversion_rate",
 ]
 
 @st.cache_data(show_spinner=True)
-def fetch_invoices(companies, start: date, end: date, include_drafts: bool, extra_filters=None, fields_add=None, user_key: str=""):
+def fetch_invoices(
+    companies, start: date, end: date, include_drafts: bool,
+    extra_filters=None, fields_add=None, user_key: str=""
+):
     if not companies:
         return pd.DataFrame()
     if start and end and start > end:
         start, end = end, start
+
     fields = BASE_FIELDS[:] + (fields_add or [])
     all_rows = []
     for co in companies:
@@ -124,9 +129,8 @@ def fetch_invoices(companies, start: date, end: date, include_drafts: bool, extr
     if "due_date" in df.columns:
         df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
 
-    # Convenience columns
+    # Convenience (company currency totals + computed base_outstanding)
     df["TTC"] = df.get("base_grand_total", 0)
-    # Compute base_outstanding = outstanding_amount * conversion_rate (avoid forbidden field)
     df["conversion_rate"] = pd.to_numeric(df.get("conversion_rate", 1), errors="coerce").fillna(1.0)
     df["outstanding_amount"] = pd.to_numeric(df.get("outstanding_amount", 0), errors="coerce").fillna(0.0)
     df["base_outstanding"] = df["outstanding_amount"] * df["conversion_rate"]
@@ -165,10 +169,50 @@ if st.button("Logout"):
     logout()
     st.rerun()
 
-# ---------------- Sidebar: Nav + filters ----------------
+# ---------------- Sidebar: NAV (single-box buttons) + Filters ----------------
+SIDEBAR_CSS = """
+<style>
+.sidebar-nav { display: flex; flex-direction: column; gap: .6rem; margin-bottom: .75rem; }
+.nav-btn .stButton > button {
+  width: 100%;
+  display: flex; align-items: center; gap: .6rem;
+  padding: .55rem .75rem;
+  border-radius: 12px;
+  border: 1px solid rgba(200,200,200,.25);
+  background: rgba(255,255,255,.02);
+  font-weight: 600;
+  transition: transform .12s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
+}
+.nav-btn .stButton > button:hover { background: rgba(255,255,255,.06); border-color: rgba(180,180,255,.45); }
+.nav-btn.active .stButton > button {
+  border-color: rgba(90,120,255,.65);
+  box-shadow: 0 0 0 2px rgba(90,120,255,.15) inset, 0 0 12px rgba(90,120,255,.18);
+  background: linear-gradient(180deg, rgba(90,120,255,.12), rgba(90,120,255,.06));
+  transform: translateZ(0) scale(1.01);
+}
+</style>
+"""
+st.sidebar.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
+
+def sidebar_nav_buttons():
+    items = [
+        ("TTC", "📈", "nav_ttc_btn"),
+        ("Debts", "💳", "nav_debts_btn"),
+        ("Customers", "👥", "nav_customers_btn"),
+    ]
+    st.sidebar.markdown('<div class="sidebar-nav">', unsafe_allow_html=True)
+    for name, icon, key in items:
+        active = (st.session_state.nav == name)
+        st.sidebar.markdown(f'<div class="nav-btn {"active" if active else ""}">', unsafe_allow_html=True)
+        if st.sidebar.button(f"{icon}  {name}", key=key, use_container_width=True):
+            st.session_state.nav = name
+            st.rerun()
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('</div>', unsafe_allow_html=True)
+
 with st.sidebar:
     st.header("Navigation")
-    nav = st.radio("Screen", ["TTC", "Debts", "Customers"], index=["TTC","Debts","Customers"].index(st.session_state.nav), key="nav")
+    sidebar_nav_buttons()
 
     st.header("Filters")
     # Companies
@@ -190,6 +234,7 @@ with st.sidebar:
 
     # Date range (stable)
     start_date, end_date = st.date_input("Date range", value=st.session_state.date_range, key="date_range")
+    # In some Streamlit versions, date_input may return a tuple:
     if isinstance(start_date, tuple):
         start_date, end_date = start_date[0], start_date[1]
     if not isinstance(start_date, date) or not isinstance(end_date, date):
@@ -210,7 +255,7 @@ def download_button(df: pd.DataFrame, filename: str, label: str):
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
 # ---------------- Screens ----------------
-if run and nav == "TTC":
+if run and st.session_state.nav == "TTC":
     st.subheader("TTC by Date (per company)")
     try:
         inv = fetch_invoices(selected_companies, start_date, end_date, include_drafts, user_key=st.session_state.user or "")
@@ -274,7 +319,7 @@ if run and nav == "TTC":
     except Exception as e:
         st.error(f"Error: {e}")
 
-elif run and nav == "Debts":
+elif run and st.session_state.nav == "Debts":
     st.subheader("Accounts Receivable (Open Debts)")
     try:
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
@@ -293,7 +338,7 @@ elif run and nav == "Debts":
         c1.metric("Total Outstanding (company currency)", f"{total_outstanding:,.2f}")
         c2.metric("Open Invoices", f"{count_open:,}")
 
-        # Per-customer outstanding (company currency)
+        # Per-customer outstanding
         per_cust = (
             open_inv.groupby(["company","customer"], as_index=False)
                     .agg(Outstanding=("base_outstanding","sum"),
@@ -302,7 +347,6 @@ elif run and nav == "Debts":
                     .sort_values(["Outstanding"], ascending=False)
         )
 
-        # Chart top 15 customers by outstanding
         st.markdown("**Top customers by outstanding**")
         topN = per_cust.nlargest(15, "Outstanding")
         if alt and not topN.empty:
@@ -325,7 +369,6 @@ elif run and nav == "Debts":
             st.dataframe(per_cust, use_container_width=True)
             download_button(per_cust, "debts_per_customer.csv", "Download per-customer CSV")
 
-        # Invoice-level table
         cols = ["name","posting_date","due_date","company","customer","base_outstanding","currency","status","days_overdue","outstanding_amount","conversion_rate"]
         cols = [c for c in cols if c in open_inv.columns]
         with st.expander("Open invoice rows"):
@@ -341,19 +384,16 @@ elif run and nav == "Debts":
     except Exception as e:
         st.error(f"Error: {e}")
 
-elif run and nav == "Customers":
+elif run and st.session_state.nav == "Customers":
     st.subheader("Customers Overview")
     try:
-        # Sales in period
         inv_period = fetch_invoices(selected_companies, start_date, end_date, include_drafts=False, user_key=st.session_state.user or "")
-        # Open AR (all dates)
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
 
         if inv_period.empty and open_inv.empty:
             st.info("No data for the selected filters.")
             st.stop()
 
-        # Aggregates in period
         if not inv_period.empty:
             agg_period = (
                 inv_period.groupby(["company","customer"], as_index=False)
@@ -362,7 +402,6 @@ elif run and nav == "Customers":
         else:
             agg_period = pd.DataFrame(columns=["company","customer","Sales_TTC","Invoices","Last_Invoice"])
 
-        # Outstanding now (all dates, company currency)
         if not open_inv.empty:
             agg_open = (
                 open_inv.groupby(["company","customer"], as_index=False)
@@ -371,7 +410,6 @@ elif run and nav == "Customers":
         else:
             agg_open = pd.DataFrame(columns=["company","customer","Outstanding"])
 
-        # Merge
         customers = pd.merge(agg_period, agg_open, on=["company","customer"], how="outer")
         for col in ["Sales_TTC","Invoices","Outstanding"]:
             if col in customers.columns:
@@ -379,26 +417,22 @@ elif run and nav == "Customers":
         if "Last_Invoice" in customers.columns:
             customers["Last_Invoice"] = pd.to_datetime(customers["Last_Invoice"])
 
-        # KPIs
         total_sales = float(customers.get("Sales_TTC", pd.Series()).sum())
         total_outstanding = float(customers.get("Outstanding", pd.Series()).sum())
         c1, c2 = st.columns(2)
         c1.metric("Total Sales TTC (period)", f"{total_sales:,.2f}")
         c2.metric("Total Outstanding (now)", f"{total_outstanding:,.2f}")
 
-        # Search/filter
         q = st.text_input("Search customer")
         if q:
             customers = customers[customers["customer"].fillna("").str.contains(q, case=False, na=False)]
 
-        # Table
         st.dataframe(
             customers.sort_values(["company","Sales_TTC"], ascending=[True, False]),
             use_container_width=True
         )
         download_button(customers, "customers_overview.csv", "Download customers CSV")
 
-        # Chart top customers by Sales_TTC
         topC = customers.nlargest(20, "Sales_TTC")
         st.markdown("**Top customers by sales (period)**")
         if alt and not topC.empty:
