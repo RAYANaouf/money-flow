@@ -1,18 +1,19 @@
-# Streamlit + ERPNext login, Multi-company picker ("All Companies"), colored lines, TTC by Date
+# Streamlit + ERPNext multi-screen: TTC, Debts (A/R), Customers
 import streamlit as st
 import requests
 import pandas as pd
 import json
+from io import StringIO
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
-# Optional (nicer chart). If missing, we fall back to st.line_chart.
+# Optional nicer charts (fallback to st.* if missing)
 try:
     import altair as alt
 except Exception:
     alt = None
 
-st.set_page_config(page_title="ERPNext Login • TTC by Date (Multi-company)", layout="wide")
+st.set_page_config(page_title="ERPNext Dashboard", layout="wide")
 
 BASE = st.secrets["erpnext"]["base_url"].rstrip("/")
 VERIFY_SSL = st.secrets["erpnext"].get("verify_ssl", True)
@@ -23,10 +24,9 @@ if "cookies" not in st.session_state:
 if "user" not in st.session_state:
     st.session_state.user = None
 if "date_range" not in st.session_state:
-    st.session_state.date_range = (
-        date.today() - relativedelta(months=3),
-        date.today()
-    )
+    st.session_state.date_range = (date.today() - relativedelta(months=3), date.today())
+if "nav" not in st.session_state:
+    st.session_state.nav = "TTC"
 
 def new_session() -> requests.Session:
     s = requests.Session()
@@ -36,12 +36,7 @@ def new_session() -> requests.Session:
 
 def login(usr: str, pwd: str) -> bool:
     s = requests.Session()
-    r = s.post(
-        f"{BASE}/api/method/login",
-        data={"usr": usr, "pwd": pwd},
-        timeout=30,
-        verify=VERIFY_SSL,
-    )
+    r = s.post(f"{BASE}/api/method/login", data={"usr": usr, "pwd": pwd}, timeout=30, verify=VERIFY_SSL)
     if r.status_code == 200 and ("sid" in s.cookies.get_dict()):
         st.session_state.cookies = s.cookies.get_dict()
         st.session_state.user = usr
@@ -75,55 +70,83 @@ def api_get(path: str, **params):
 # ---------------- Data Fetchers ----------------
 @st.cache_data(show_spinner=False)
 def list_companies(user_key: str):
-    data = api_get(
-        "/api/resource/Company",
-        fields=json.dumps(["name"]),
-        order_by="name asc",
-        limit_page_length=1000,
-    )
+    data = api_get("/api/resource/Company", fields=json.dumps(["name"]), order_by="name asc", limit_page_length=1000)
     return [row["name"] for row in data]
 
+# NOTE: do NOT request base_outstanding_amount (blocked in list API)
+BASE_FIELDS = [
+    "name", "posting_date", "company", "customer", "due_date",
+    "base_grand_total", "grand_total", "currency",
+    "outstanding_amount", "status", "conversion_rate"
+]
+
 @st.cache_data(show_spinner=True)
-def fetch_sales_invoices(company: str, start: date, end: date, include_drafts: bool, user_key: str):
-    # Ensure order
-    if start > end:
+def fetch_invoices(companies, start: date, end: date, include_drafts: bool, extra_filters=None, fields_add=None, user_key: str=""):
+    if not companies:
+        return pd.DataFrame()
+    if start and end and start > end:
         start, end = end, start
+    fields = BASE_FIELDS[:] + (fields_add or [])
+    all_rows = []
+    for co in companies:
+        filters = [["company", "=", co]]
+        if start and end:
+            filters += [["posting_date", ">=", str(start)], ["posting_date", "<=", str(end)]]
+        if include_drafts:
+            filters.append(["docstatus", "in", [0, 1]])
+        else:
+            filters.append(["docstatus", "=", 1])
+        if extra_filters:
+            filters += extra_filters
 
-    filters = [
-        ["company", "=", company],
-        ["posting_date", ">=", str(start)],
-        ["posting_date", "<=", str(end)],
-    ]
-    if include_drafts:
-        filters.append(["docstatus", "in", [0, 1]])  # drafts + submitted
-    else:
-        filters.append(["docstatus", "=", 1])        # submitted only
+        params = {
+            "fields": json.dumps(list(dict.fromkeys(fields))),
+            "filters": json.dumps(filters),
+            "order_by": "posting_date asc, name asc",
+            "limit_page_length": 5000,
+        }
 
-    params = {
-        "fields": json.dumps(["name", "posting_date", "company", "base_grand_total", "currency"]),
-        "filters": json.dumps(filters),
-        "order_by": "posting_date asc, name asc",
-        "limit_page_length": 5000,
-    }
+        start_idx = 0
+        while True:
+            page = api_get("/api/resource/Sales Invoice", **{**params, "limit_start": start_idx})
+            all_rows.extend(page)
+            if len(page) < 5000:
+                break
+            start_idx += 5000
 
-    rows, start_idx = [], 0
-    while True:
-        page = api_get("/api/resource/Sales Invoice", **{**params, "limit_start": start_idx})
-        rows.extend(page)
-        if len(page) < 5000:
-            break
-        start_idx += 5000
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows)
     if df.empty:
         return df
-    df["posting_date"] = pd.to_datetime(df["posting_date"])
-    df["TTC"] = df["base_grand_total"]  # company currency
+
+    # Types
+    if "posting_date" in df.columns:
+        df["posting_date"] = pd.to_datetime(df["posting_date"])
+    if "due_date" in df.columns:
+        df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
+
+    # Convenience columns
+    df["TTC"] = df.get("base_grand_total", 0)
+    # Compute base_outstanding = outstanding_amount * conversion_rate (avoid forbidden field)
+    df["conversion_rate"] = pd.to_numeric(df.get("conversion_rate", 1), errors="coerce").fillna(1.0)
+    df["outstanding_amount"] = pd.to_numeric(df.get("outstanding_amount", 0), errors="coerce").fillna(0.0)
+    df["base_outstanding"] = df["outstanding_amount"] * df["conversion_rate"]
+
     return df
 
-# ---------------- UI ----------------
-st.title("ERPNext Login • TTC by Date (Multi-company)")
+@st.cache_data(show_spinner=True)
+def fetch_outstanding_invoices(companies, user_key: str=""):
+    # All open AR, regardless of date
+    return fetch_invoices(
+        companies=companies,
+        start=None, end=None,
+        include_drafts=False,
+        extra_filters=[["outstanding_amount", ">", 0]],
+        fields_add=[],
+        user_key=user_key
+    )
 
+# ---------------- UI: Login ----------------
+st.title("ERPNext Dashboard")
 if not st.session_state.user:
     st.subheader("Log in to ERPNext")
     with st.form("login_form", clear_on_submit=False):
@@ -131,11 +154,10 @@ if not st.session_state.user:
         pwd = st.text_input("Password", type="password", value="", autocomplete="current-password")
         colA, colB = st.columns([1, 1])
         submit = colA.form_submit_button("Log in")
-        colB.caption("Your password is not stored; only a session cookie is kept in memory.")
-    if submit:
-        if login(usr, pwd):
-            st.success(f"Logged in as {st.session_state.user}")
-            st.rerun()
+        colB.caption("Your password is not stored; only a session cookie is used.")
+    if submit and login(usr, pwd):
+        st.success(f"Logged in as {st.session_state.user}")
+        st.rerun()
     st.stop()
 
 st.success(f"Logged in as {st.session_state.user}")
@@ -143,130 +165,257 @@ if st.button("Logout"):
     logout()
     st.rerun()
 
+# ---------------- Sidebar: Nav + filters ----------------
 with st.sidebar:
-    st.header("Filters")
+    st.header("Navigation")
+    nav = st.radio("Screen", ["TTC", "Debts", "Customers"], index=["TTC","Debts","Customers"].index(st.session_state.nav), key="nav")
 
-    # Companies list
+    st.header("Filters")
+    # Companies
     try:
         companies = list_companies(st.session_state.user or "")
     except Exception as e:
         st.error(f"Cannot load companies: {e}")
         st.stop()
     if not companies:
-        st.error("No companies available for this user.")
+        st.error("No companies available.")
         st.stop()
 
-    # Multiselect with "All Companies"
-    options = ["All Companies"] + companies
-    default_selection = ["All Companies"]  # preselect "All" for convenience
-    selected = st.multiselect("Companies", options, default=default_selection, key="companies_multi")
-
-    # Resolve "All Companies"
-    if "All Companies" in selected:
-        selected_companies = companies[:]  # all
+    company_options = ["All Companies"] + companies
+    selected = st.multiselect("Companies", company_options, default=["All Companies"], key="companies_multi")
+    if "All Companies" in selected or not selected:
+        selected_companies = companies[:]
     else:
-        selected_companies = list(dict.fromkeys([c for c in selected if c in companies]))
+        selected_companies = [c for c in selected if c in companies]
 
-    # Date range (stable via session_state)
-    start_date, end_date = st.date_input(
-        "Date range",
-        value=st.session_state.date_range,
-        key="date_range",
-    )
+    # Date range (stable)
+    start_date, end_date = st.date_input("Date range", value=st.session_state.date_range, key="date_range")
+    if isinstance(start_date, tuple):
+        start_date, end_date = start_date[0], start_date[1]
     if not isinstance(start_date, date) or not isinstance(end_date, date):
         st.error("Please select a valid start and end date.")
         st.stop()
     if start_date > end_date:
         start_date, end_date = end_date, start_date
 
-    include_drafts = st.toggle("Include Draft Invoices (testing)", value=False, key="include_drafts")
+    include_drafts = st.toggle("Include Draft Invoices (for TTC only)", value=False, key="include_drafts")
+
     run = st.button("Load data")
 
-if run:
-    if not selected_companies:
-        st.warning("Please select at least one company.")
-        st.stop()
+# ---------------- Helpers ----------------
+def download_button(df: pd.DataFrame, filename: str, label: str):
+    if df.empty:
+        return
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
-    all_invoices = []  # invoice-level rows for all companies
-    all_daily = []     # daily TTC per company
-
+# ---------------- Screens ----------------
+if run and nav == "TTC":
+    st.subheader("TTC by Date (per company)")
     try:
-        for co in selected_companies:
-            df_co = fetch_sales_invoices(co, start_date, end_date, include_drafts, st.session_state.user or "")
-            if df_co.empty:
-                continue
-            all_invoices.append(df_co)
-
-            # Daily aggregation for this company
-            daily_co = (
-                df_co.set_index("posting_date")
-                     .resample("D")["TTC"]
-                     .sum()
-                     .reset_index()
-                     .rename(columns={"posting_date": "date"})
-            )
-            daily_co["company"] = co
-            all_daily.append(daily_co)
-
-        if not all_invoices:
-            st.info("No invoices found for the selected filters.")
+        inv = fetch_invoices(selected_companies, start_date, end_date, include_drafts, user_key=st.session_state.user or "")
+        if inv.empty:
+            st.info("No invoices found.")
             st.stop()
 
-        invoices_df = pd.concat(all_invoices, ignore_index=True)
-        daily_df = pd.concat(all_daily, ignore_index=True) if all_daily else pd.DataFrame(columns=["date","TTC","company"])
-        # Ensure correct dtypes
-        if not daily_df.empty:
-            daily_df["date"] = pd.to_datetime(daily_df["date"])
+        # Daily per company
+        all_daily = []
+        for co, df_co in inv.groupby("company"):
+            d = (
+                df_co.set_index("posting_date")["TTC"]
+                .resample("D").sum()
+                .reset_index()
+                .rename(columns={"posting_date": "date"})
+            )
+            d["company"] = co
+            all_daily.append(d)
+        daily_df = pd.concat(all_daily, ignore_index=True)
 
-        # ----- KPIs -----
-        total_ttc = float(invoices_df["TTC"].sum())
-        inv_count = len(invoices_df)
+        # KPIs
+        total_ttc = float(inv["TTC"].sum())
+        inv_count = len(inv)
         c1, c2 = st.columns(2)
         c1.metric("Total TTC (company currency)", f"{total_ttc:,.2f}")
         c2.metric("Invoices", f"{inv_count:,}")
 
-        # Per-company summary
-        summary = (
-            invoices_df.groupby("company", as_index=False)
-                       .agg(TTC=("TTC","sum"), Invoices=("name","count"))
-                       .sort_values("TTC", ascending=False)
-        )
-        with st.expander("Per-company totals"):
-            st.dataframe(summary, use_container_width=True)
-
-        # ----- Chart (colored by company) -----
-        st.subheader("TTC by Date (per company)")
-        if daily_df.empty:
-            st.info("No daily data to chart.")
-        else:
-            if alt:
-                chart = (
-                    alt.Chart(daily_df)
-                       .mark_line()
-                       .encode(
-                           x=alt.X("date:T", title="Date"),
-                           y=alt.Y("TTC:Q", title="TTC"),
-                           color=alt.Color("company:N", title="Company"),
-                           tooltip=[alt.Tooltip("company:N"), alt.Tooltip("date:T"), alt.Tooltip("TTC:Q")]
-                       )
-                       .properties(height=380)
-                       .interactive()
+        # Chart
+        if alt:
+            chart = (
+                alt.Chart(daily_df)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("TTC:Q", title="TTC"),
+                    color=alt.Color("company:N", title="Company"),
+                    tooltip=["company:N","date:T","TTC:Q"]
                 )
-                st.altair_chart(chart, use_container_width=True)
-            else:
-                # Fallback: wide format for st.line_chart (auto-colors columns)
-                wide = daily_df.pivot(index="date", columns="company", values="TTC").fillna(0)
-                st.line_chart(wide)
+                .properties(height=380)
+                .interactive()
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            wide = daily_df.pivot(index="date", columns="company", values="TTC").fillna(0)
+            st.line_chart(wide)
 
-        # ----- Tables -----
-        with st.expander("Daily totals (all companies)"):
-            st.dataframe(daily_df.sort_values(["date", "company"]), use_container_width=True)
+        with st.expander("Daily totals"):
+            st.dataframe(daily_df.sort_values(["date","company"]), use_container_width=True)
+            download_button(daily_df, "ttc_daily.csv", "Download daily TTC CSV")
 
         with st.expander("Invoice rows"):
-            st.dataframe(
-                invoices_df[["name", "posting_date", "company", "base_grand_total", "currency"]],
-                use_container_width=True
+            st.dataframe(inv[["name","posting_date","company","customer","base_grand_total","currency"]], use_container_width=True)
+            download_button(inv, "ttc_invoices.csv", "Download invoices CSV")
+
+    except requests.HTTPError as e:
+        st.error("ERPNext API error.")
+        try:
+            st.code(e.response.text)
+        except Exception:
+            st.write(e)
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+elif run and nav == "Debts":
+    st.subheader("Accounts Receivable (Open Debts)")
+    try:
+        open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
+        if open_inv.empty:
+            st.info("No open debts found.")
+            st.stop()
+
+        # Aging
+        today = pd.Timestamp(date.today())
+        open_inv["days_overdue"] = (today - open_inv["due_date"]).dt.days
+        open_inv["days_overdue"] = open_inv["days_overdue"].fillna(0).astype(int)
+
+        total_outstanding = float(open_inv.get("base_outstanding", pd.Series()).fillna(0).sum())
+        count_open = len(open_inv)
+        c1, c2 = st.columns(2)
+        c1.metric("Total Outstanding (company currency)", f"{total_outstanding:,.2f}")
+        c2.metric("Open Invoices", f"{count_open:,}")
+
+        # Per-customer outstanding (company currency)
+        per_cust = (
+            open_inv.groupby(["company","customer"], as_index=False)
+                    .agg(Outstanding=("base_outstanding","sum"),
+                         Invoices=("name","count"),
+                         MaxOverdue=("days_overdue","max"))
+                    .sort_values(["Outstanding"], ascending=False)
+        )
+
+        # Chart top 15 customers by outstanding
+        st.markdown("**Top customers by outstanding**")
+        topN = per_cust.nlargest(15, "Outstanding")
+        if alt and not topN.empty:
+            chart = (
+                alt.Chart(topN)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Outstanding:Q", title="Outstanding"),
+                    y=alt.Y("customer:N", sort="-x", title="Customer"),
+                    color=alt.Color("company:N", title="Company"),
+                    tooltip=["company:N","customer:N","Outstanding:Q","Invoices:Q","MaxOverdue:Q"]
+                )
+                .properties(height=400)
             )
+            st.altair_chart(chart, use_container_width=True)
+        elif not topN.empty:
+            st.bar_chart(topN.set_index("customer")["Outstanding"])
+
+        with st.expander("Per-customer table"):
+            st.dataframe(per_cust, use_container_width=True)
+            download_button(per_cust, "debts_per_customer.csv", "Download per-customer CSV")
+
+        # Invoice-level table
+        cols = ["name","posting_date","due_date","company","customer","base_outstanding","currency","status","days_overdue","outstanding_amount","conversion_rate"]
+        cols = [c for c in cols if c in open_inv.columns]
+        with st.expander("Open invoice rows"):
+            st.dataframe(open_inv[cols].sort_values(["company","customer","due_date"]), use_container_width=True)
+            download_button(open_inv[cols], "debts_open_invoices.csv", "Download open invoices CSV")
+
+    except requests.HTTPError as e:
+        st.error("ERPNext API error.")
+        try:
+            st.code(e.response.text)
+        except Exception:
+            st.write(e)
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+elif run and nav == "Customers":
+    st.subheader("Customers Overview")
+    try:
+        # Sales in period
+        inv_period = fetch_invoices(selected_companies, start_date, end_date, include_drafts=False, user_key=st.session_state.user or "")
+        # Open AR (all dates)
+        open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
+
+        if inv_period.empty and open_inv.empty:
+            st.info("No data for the selected filters.")
+            st.stop()
+
+        # Aggregates in period
+        if not inv_period.empty:
+            agg_period = (
+                inv_period.groupby(["company","customer"], as_index=False)
+                          .agg(Sales_TTC=("TTC","sum"), Invoices=("name","count"), Last_Invoice=("posting_date","max"))
+            )
+        else:
+            agg_period = pd.DataFrame(columns=["company","customer","Sales_TTC","Invoices","Last_Invoice"])
+
+        # Outstanding now (all dates, company currency)
+        if not open_inv.empty:
+            agg_open = (
+                open_inv.groupby(["company","customer"], as_index=False)
+                        .agg(Outstanding=("base_outstanding","sum"))
+            )
+        else:
+            agg_open = pd.DataFrame(columns=["company","customer","Outstanding"])
+
+        # Merge
+        customers = pd.merge(agg_period, agg_open, on=["company","customer"], how="outer")
+        for col in ["Sales_TTC","Invoices","Outstanding"]:
+            if col in customers.columns:
+                customers[col] = customers[col].fillna(0)
+        if "Last_Invoice" in customers.columns:
+            customers["Last_Invoice"] = pd.to_datetime(customers["Last_Invoice"])
+
+        # KPIs
+        total_sales = float(customers.get("Sales_TTC", pd.Series()).sum())
+        total_outstanding = float(customers.get("Outstanding", pd.Series()).sum())
+        c1, c2 = st.columns(2)
+        c1.metric("Total Sales TTC (period)", f"{total_sales:,.2f}")
+        c2.metric("Total Outstanding (now)", f"{total_outstanding:,.2f}")
+
+        # Search/filter
+        q = st.text_input("Search customer")
+        if q:
+            customers = customers[customers["customer"].fillna("").str.contains(q, case=False, na=False)]
+
+        # Table
+        st.dataframe(
+            customers.sort_values(["company","Sales_TTC"], ascending=[True, False]),
+            use_container_width=True
+        )
+        download_button(customers, "customers_overview.csv", "Download customers CSV")
+
+        # Chart top customers by Sales_TTC
+        topC = customers.nlargest(20, "Sales_TTC")
+        st.markdown("**Top customers by sales (period)**")
+        if alt and not topC.empty:
+            chart = (
+                alt.Chart(topC)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Sales_TTC:Q", title="Sales TTC (period)"),
+                    y=alt.Y("customer:N", sort="-x", title="Customer"),
+                    color=alt.Color("company:N", title="Company"),
+                    tooltip=["company:N","customer:N","Sales_TTC:Q","Invoices:Q","Outstanding:Q","Last_Invoice:T"]
+                )
+                .properties(height=400)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        elif not topC.empty:
+            st.bar_chart(topC.set_index("customer")["Sales_TTC"])
 
     except requests.HTTPError as e:
         st.error("ERPNext API error.")
