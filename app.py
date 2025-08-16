@@ -3,6 +3,8 @@
 # - Paramétrage to include Suppliers on the Map (Supplier.custom_lat/custom_lon)
 # - Persistent "Load data" state and sticky Map settings
 # - Nicer tooltips (label + status + phone)
+# - NEW: Supplier → Company outbound flows (period)
+# - NEW: Ignore (0,0) coordinates everywhere (customers, suppliers, company coords for flows)
 
 import streamlit as st
 import requests
@@ -94,6 +96,9 @@ MAP_DEFAULTS = {
     "jitter_on": True,
     "theme": "Positron (Light, no token)",
     "show_all_counts": True,
+    # Flow defaults
+    "show_supply_flows": False,
+    "flow_px": 4,
 }
 for k, v in MAP_DEFAULTS.items():
     st.session_state.setdefault(k, v)
@@ -143,6 +148,26 @@ def api_get(path: str, **params):
 def list_companies(user_key: str):
     data = api_get("/api/resource/Company", fields=json.dumps(["name"]), order_by="name asc", limit_page_length=1000)
     return [row["name"] for row in data]
+
+# Companies with coordinates (for flows)
+@st.cache_data(show_spinner=False)
+def list_companies_df(user_key: str=""):
+    """Companies with optional custom lat/lon (expects custom fields on Company)."""
+    fields = ["name", "custom_lat", "custom_lon"]
+    rows, start_idx = [], 0
+    params = dict(fields=json.dumps(fields), order_by="name asc", limit_page_length=1000)
+    while True:
+        page = api_get("/api/resource/Company", **{**params, "limit_start": start_idx})
+        if not page:
+            break
+        rows.extend(page)
+        start_idx += len(page)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["custom_lat"] = pd.to_numeric(df.get("custom_lat"), errors="coerce")
+    df["custom_lon"] = pd.to_numeric(df.get("custom_lon"), errors="coerce")
+    return df
 
 BASE_FIELDS = [
     "name", "posting_date", "company", "customer", "due_date",
@@ -299,6 +324,17 @@ def fetch_purchase_invoices(companies, start: date, end: date, include_drafts=Fa
     if "posting_date" in df.columns:
         df["posting_date"] = pd.to_datetime(df["posting_date"])
     return df
+
+# ------------------ Utility: filter (0,0) and NaNs ------------------
+def filter_valid_coords(df: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataFrame:
+    """Keep rows with real coordinates: both present and not equal to (0,0)."""
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    d[lat_col] = pd.to_numeric(d.get(lat_col), errors="coerce")
+    d[lon_col] = pd.to_numeric(d.get(lon_col), errors="coerce")
+    m = d[lat_col].notna() & d[lon_col].notna() & ~((d[lat_col] == 0) & (d[lon_col] == 0))
+    return d.loc[m]
 
 # ------------------ UI: Login ------------------
 st.title("ERPNext Dashboard")
@@ -626,7 +662,7 @@ elif st.session_state.run and st.session_state.nav == "Customers":
 
 elif st.session_state.run and st.session_state.nav == "Map":
     st.subheader("🗺️  Sales & Suppliers Map (from custom_lat/custom_lon only)")
-    st.caption("Customers: Blue = bought in selected period, Gray = no sale. Suppliers: Green = purchased from in period, Light green = no purchase in period.")
+    st.caption("Customers: Blue = bought in selected period, Gray = no sale. Suppliers: Green = purchased from in period, Light green = no purchase in period. Flows: Supplier → Company for purchases in the selected period.")
 
     # ---- Paramétrage ----
     with st.expander("⚙️ Paramétrage (Map Settings)", expanded=True):
@@ -651,6 +687,14 @@ elif st.session_state.run and st.session_state.nav == "Map":
             st.slider("Suppliers point size (px)", 2, 16, key="supp_px")
         with colz4:
             st.toggle("Anti-overlap jitter", key="jitter_on", help="Adds tiny random offsets so nearby points don't overlap.")
+
+        # Flow controls
+        st.toggle(
+            "Show Supplier → Company flows (period)",
+            key="show_supply_flows",
+            help="Draw arcs from supplier to the company that purchased during the selected period."
+        )
+        st.slider("Flow line width (px)", 1, 10, key="flow_px")
 
         st.selectbox(
             "Basemap theme",
@@ -710,9 +754,10 @@ elif st.session_state.run and st.session_state.nav == "Map":
                 data_c.rename(columns={"display_customer": "customer"}, inplace=True)
 
                 total_customers = len(data_c)
-                with_coords_c = int(data_c.dropna(subset=["custom_lat","custom_lon"]).shape[0])
+                valid_c = filter_valid_coords(data_c, "custom_lat", "custom_lon")
+                with_coords_c = int(len(valid_c))
 
-                plot_c = data_c.dropna(subset=["custom_lat","custom_lon"]).copy()
+                plot_c = valid_c.copy()
 
                 # ---- Tooltip-friendly columns ----
                 plot_c["label"] = "Customer: " + plot_c["customer"].fillna(plot_c["name"])
@@ -775,6 +820,8 @@ elif st.session_state.run and st.session_state.nav == "Map":
         # ================= Suppliers =================
         supp_n = supp_active_n = 0
         total_suppliers = with_coords_s = 0
+        # Store pinv_period for flows regardless of status coloring
+        pinv_period = pd.DataFrame()
         if show_suppliers:
             # active suppliers (had purchase invoices in period)
             pinv_period = fetch_purchase_invoices(
@@ -794,9 +841,10 @@ elif st.session_state.run and st.session_state.nav == "Map":
                 data_s.rename(columns={"display_supplier": "supplier"}, inplace=True)
 
                 total_suppliers = len(data_s)
-                with_coords_s = int(data_s.dropna(subset=["custom_lat","custom_lon"]).shape[0])
+                valid_s = filter_valid_coords(data_s, "custom_lat", "custom_lon")
+                with_coords_s = int(len(valid_s))
 
-                plot_s = data_s.dropna(subset=["custom_lat","custom_lon"]).copy()
+                plot_s = valid_s.copy()
 
                 # ---- Tooltip-friendly columns ----
                 plot_s["label"] = "Supplier: " + plot_s["supplier"].fillna(plot_s["name"])
@@ -875,6 +923,62 @@ elif st.session_state.run and st.session_state.nav == "Map":
                         pickable=True,
                         get_fill_color=[0,160,70,200],  # green
                     ))
+
+        # ================= Supplier -> Company FLOWS =================
+        if show_suppliers and st.session_state.get("show_supply_flows", False):
+            # 1) Companies with coords (exclude 0,0)
+            comp_df = list_companies_df(st.session_state.user or "")
+            comp_coords = filter_valid_coords(comp_df, "custom_lat", "custom_lon").rename(
+                columns={"custom_lat":"comp_lat","custom_lon":"comp_lon","name":"company"}
+            )
+
+            # 2) Suppliers with coords (exclude 0,0)
+            if 'supp_df' not in locals():
+                supp_df = list_suppliers()
+            supp_coords = filter_valid_coords(supp_df, "custom_lat", "custom_lon").rename(
+                columns={"custom_lat":"sup_lat","custom_lon":"sup_lon","name":"supplier"}
+            )
+
+            # 3) Purchase links in the period (sum amount per supplier->company)
+            flows = pd.DataFrame()
+            if 'pinv_period' in locals() and not pinv_period.empty and not comp_coords.empty and not supp_coords.empty:
+                tmp = (pinv_period[["supplier","company","base_grand_total"]]
+                       .dropna(subset=["supplier","company"]))
+                flows = (tmp.groupby(["supplier","company"], as_index=False)
+                            .agg(amount=("base_grand_total","sum")))
+                flows = (flows
+                         .merge(supp_coords[["supplier","sup_lat","sup_lon"]], on="supplier", how="inner")
+                         .merge(comp_coords[["company","comp_lat","comp_lon"]], on="company", how="inner"))
+
+            if not flows.empty:
+                center_lats.extend(flows["sup_lat"].tolist() + flows["comp_lat"].tolist())
+                center_lons.extend(flows["sup_lon"].tolist() + flows["comp_lon"].tolist())
+
+                amt = flows["amount"].fillna(0)
+                base_width = float(st.session_state.flow_px)
+                if amt.max() > 0:
+                    flows["width_px"] = (amt / amt.max() * (base_width * 2)).clip(lower=base_width, upper=base_width*2).astype(float)
+                else:
+                    flows["width_px"] = base_width
+
+                flows["label"] = flows.apply(
+                    lambda r: f"Supplier → Company<br>{r['supplier']} → {r['company']}<br>Amount: {r['amount']:,.2f}",
+                    axis=1
+                )
+
+                import pydeck as pdk
+                layers.append(pdk.Layer(
+                    "ArcLayer",
+                    data=flows,
+                    get_source_position='[sup_lon, sup_lat]',
+                    get_target_position='[comp_lon, comp_lat]',
+                    get_width="width_px",
+                    get_tilt=15,
+                    pickable=True,
+                    great_circle=True,
+                    get_source_color=[0, 160, 70, 160],   # green-ish at supplier
+                    get_target_color=[0, 120, 255, 180],  # blue-ish at company
+                ))
 
         # ================= KPIs =================
         if st.session_state.show_all_counts:
