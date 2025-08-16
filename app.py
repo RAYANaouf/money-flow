@@ -1,5 +1,8 @@
 # ERPNext Dashboard: TTC, Debts (A/R), Customers, Map
-# Map uses ONLY Customer.custom_lat/custom_lon (no Address fallback)
+# - Map uses ONLY Customer.custom_lat/custom_lon (no Address fallback)
+# - Paramétrage to include Suppliers on the Map (Supplier.custom_lat/custom_lon)
+# - Persistent "Load data" state and sticky Map settings
+# - Nicer tooltips (label + status + phone)
 
 import streamlit as st
 import requests
@@ -14,7 +17,7 @@ import numpy as np
 try:
     import pydeck as pdk  # noqa
 except Exception:
-    pdk = None  # will import inside Map screen
+    pdk = None  # imported later only when needed
 
 st.set_page_config(page_title="ERPNext Dashboard", layout="wide")
 
@@ -60,7 +63,7 @@ BASE = get_secret(("erpnext", "base_url"))
 VERIFY_SSL = get_secret(("erpnext", "verify_ssl"), True)
 MAPBOX_TOKEN = get_secret(("mapbox", "token"), "")
 
-# If missing secrets, allow inline config so app doesn't crash on Cloud
+# Allow inline config so app doesn't crash on Cloud
 if not BASE:
     with st.sidebar:
         st.warning("ERPNext settings are missing. Enter them here or add them in **Manage app → Settings → Secrets**.")
@@ -75,8 +78,25 @@ BASE = BASE.rstrip("/")
 # ------------------ Session State ------------------
 if "cookies" not in st.session_state: st.session_state.cookies = None
 if "user" not in st.session_state: st.session_state.user = None
-if "date_range" not in st.session_state: st.session_state.date_range = (date.today() - relativedelta(months=3), date.today())
+if "date_range" not in st.session_state:
+    st.session_state.date_range = (date.today() - relativedelta(months=3), date.today())
 if "nav" not in st.session_state: st.session_state.nav = "TTC"
+if "run" not in st.session_state: st.session_state.run = False  # keep dataset "loaded" after first click
+
+# Map defaults (persist across reruns)
+MAP_DEFAULTS = {
+    "show_customers": True,
+    "show_suppliers": False,
+    "supplier_status_by_period": True,
+    "sold_px": 6,
+    "idle_px": 5,
+    "supp_px": 7,
+    "jitter_on": True,
+    "theme": "Positron (Light, no token)",
+    "show_all_counts": True,
+}
+for k, v in MAP_DEFAULTS.items():
+    st.session_state.setdefault(k, v)
 
 # ------------------ HTTP helpers ------------------
 def new_session() -> requests.Session:
@@ -121,7 +141,6 @@ def api_get(path: str, **params):
 # ------------------ Data Fetchers (robust pagination) ------------------
 @st.cache_data(show_spinner=False)
 def list_companies(user_key: str):
-    # Companies are usually small; one shot is fine
     data = api_get("/api/resource/Company", fields=json.dumps(["name"]), order_by="name asc", limit_page_length=1000)
     return [row["name"] for row in data]
 
@@ -153,7 +172,7 @@ def fetch_invoices(companies, start: date, end: date, include_drafts: bool,
             "fields": json.dumps(list(dict.fromkeys(fields))),
             "filters": json.dumps(filters),
             "order_by": "posting_date asc, name asc",
-            "limit_page_length": 1000,  # request big pages, but don't rely on this for stopping
+            "limit_page_length": 1000,
         }
 
         start_idx = 0
@@ -162,7 +181,7 @@ def fetch_invoices(companies, start: date, end: date, include_drafts: bool,
             if not page:
                 break
             all_rows.extend(page)
-            start_idx += len(page)  # advance by what we actually got (robust to server caps)
+            start_idx += len(page)
 
     df = pd.DataFrame(all_rows)
     if df.empty: return df
@@ -198,7 +217,7 @@ def list_customers():
         if not page:
             break
         all_rows.extend(page)
-        start_idx += len(page)  # advance by what we actually got
+        start_idx += len(page)
 
     df = pd.DataFrame(all_rows)
     if df.empty: return df
@@ -210,6 +229,75 @@ def list_customers():
 
     df["custom_lat"] = pd.to_numeric(df.get("custom_lat"), errors="coerce")
     df["custom_lon"] = pd.to_numeric(df.get("custom_lon"), errors="coerce")
+    return df
+
+# ------------------ Suppliers & Purchase Invoices ------------------
+@st.cache_data(show_spinner=True)
+def list_suppliers():
+    """Suppliers with coords (uses Supplier.custom_lat/custom_lon)."""
+    fields = ["name", "supplier_name", "supplier_group", "mobile_no", "custom_lat", "custom_lon"]
+    all_rows, start_idx = [], 0
+    params = dict(fields=json.dumps(fields), order_by="name asc", limit_page_length=1000)
+
+    while True:
+        page = api_get("/api/resource/Supplier", **{**params, "limit_start": start_idx})
+        if not page:
+            break
+        all_rows.extend(page)
+        start_idx += len(page)
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+
+    disp = df.get("supplier_name").fillna("")
+    disp = disp.replace("", np.nan)
+    df["display_supplier"] = disp.fillna(df.get("name"))
+
+    df["custom_lat"] = pd.to_numeric(df.get("custom_lat"), errors="coerce")
+    df["custom_lon"] = pd.to_numeric(df.get("custom_lon"), errors="coerce")
+    return df
+
+PURCHASE_FIELDS = [
+    "name","posting_date","company","supplier","base_grand_total","grand_total","currency","status","docstatus"
+]
+
+@st.cache_data(show_spinner=True)
+def fetch_purchase_invoices(companies, start: date, end: date, include_drafts=False, user_key: str=""):
+    if not companies:
+        return pd.DataFrame()
+    if start and end and start > end:
+        start, end = end, start
+
+    fields = PURCHASE_FIELDS[:]
+    all_rows = []
+
+    for co in companies:
+        filters = [["company", "=", co]]
+        if start and end:
+            filters += [["posting_date", ">=", str(start)], ["posting_date", "<=", str(end)]]
+        filters.append(["docstatus", "in", [0, 1]] if include_drafts else ["docstatus", "=", 1])
+
+        params = {
+            "fields": json.dumps(list(dict.fromkeys(fields))),
+            "filters": json.dumps(filters),
+            "order_by": "posting_date asc, name asc",
+            "limit_page_length": 1000,
+        }
+
+        start_idx = 0
+        while True:
+            page = api_get("/api/resource/Purchase Invoice", **{**params, "limit_start": start_idx})
+            if not page:
+                break
+            all_rows.extend(page)
+            start_idx += len(page)
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+    if "posting_date" in df.columns:
+        df["posting_date"] = pd.to_datetime(df["posting_date"])
     return df
 
 # ------------------ UI: Login ------------------
@@ -308,7 +396,15 @@ with st.sidebar:
     if start_date > end_date: start_date, end_date = end_date, start_date
 
     include_drafts = st.toggle("Include Draft Invoices (for TTC only)", value=False, key="include_drafts")
-    run = st.button("Load data")
+
+    if st.button("Load data", key="load_btn"):
+        st.session_state.run = True
+
+    # Auto refresh caches when filters change
+    if st.session_state.get("run"):
+        if st.session_state.get("last_filters") != (tuple(selected_companies), str(start_date), str(end_date), st.session_state.include_drafts):
+            st.cache_data.clear()
+            st.session_state.last_filters = (tuple(selected_companies), str(start_date), str(end_date), st.session_state.include_drafts)
 
 # ------------------ Helpers ------------------
 def download_button(df: pd.DataFrame, filename: str, label: str):
@@ -317,7 +413,7 @@ def download_button(df: pd.DataFrame, filename: str, label: str):
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
 # ------------------ Screens ------------------
-if run and st.session_state.nav == "TTC":
+if st.session_state.run and st.session_state.nav == "TTC":
     st.subheader("💰 Revenue Analytics")
     try:
         inv = fetch_invoices(selected_companies, start_date, end_date, include_drafts, user_key=st.session_state.user or "")
@@ -422,7 +518,7 @@ if run and st.session_state.nav == "TTC":
     except Exception as e:
         st.error(f"❌ Error: {e}")
 
-elif run and st.session_state.nav == "Debts":
+elif st.session_state.run and st.session_state.nav == "Debts":
     st.subheader("💳  Debts (A/R)")
     try:
         open_inv = fetch_outstanding_invoices(selected_companies, user_key=st.session_state.user or "")
@@ -470,7 +566,7 @@ elif run and st.session_state.nav == "Debts":
     except Exception as e:
         st.error(f"Error: {e}")
 
-elif run and st.session_state.nav == "Customers":
+elif st.session_state.run and st.session_state.nav == "Customers":
     st.subheader("👥  Customers Overview")
     try:
         inv_period = fetch_invoices(selected_companies, start_date, end_date, include_drafts=False, user_key=st.session_state.user or "")
@@ -528,33 +624,61 @@ elif run and st.session_state.nav == "Customers":
     except Exception as e:
         st.error(f"Error: {e}")
 
-elif run and st.session_state.nav == "Map":
-    st.subheader("🗺️  Clients Sales Map (from Customer.custom_lat/custom_lon only)")
-    st.caption("Blue = customers who bought in the selected period; Gray = customers who did not.")
+elif st.session_state.run and st.session_state.nav == "Map":
+    st.subheader("🗺️  Sales & Suppliers Map (from custom_lat/custom_lon only)")
+    st.caption("Customers: Blue = bought in selected period, Gray = no sale. Suppliers: Green = purchased from in period, Light green = no purchase in period.")
 
-    # ---- Small UI controls for size/readability ----
-    colz1, colz2, colz3, colz4 = st.columns([1,1,1,1])
-    with colz1:
-        sold_px = st.slider("Sold point size (px)", 2, 16, 6)
-    with colz2:
-        idle_px = st.slider("No-sale point size (px)", 2, 16, 5)
-    with colz3:
-        jitter_on = st.toggle("Anti-overlap jitter", value=True, help="Adds tiny random offsets so nearby customers don't overlap.")
-    with colz4:
-        show_all_counts = st.toggle("Show counts", value=True)
+    # ---- Paramétrage ----
+    with st.expander("⚙️ Paramétrage (Map Settings)", expanded=True):
+        colp1, colp2, colp3 = st.columns([1,1,1])
+        with colp1:
+            st.checkbox("Show Customers", key="show_customers")
+        with colp2:
+            st.checkbox("Show Suppliers", key="show_suppliers")
+        with colp3:
+            st.checkbox(
+                "Color suppliers by period activity",
+                key="supplier_status_by_period",
+                help="If on, suppliers with Purchase Invoices in the selected period are darker green."
+            )
 
-    # ---- Basemap theme selector (modern, light defaults) ----
-    theme = st.selectbox(
-        "Basemap theme",
-        [
-            "Positron (Light, no token)",
-            "Voyager (Labels, no token)",
-            "Mapbox Light (token)",
-            "Mapbox Streets (token)",
-            "Dark Matter (no token)"
-        ],
-        index=0
-    )
+        colz1, colz2, colz3, colz4 = st.columns([1,1,1,1])
+        with colz1:
+            st.slider("Sold (customers) point size (px)", 2, 16, key="sold_px")
+        with colz2:
+            st.slider("No-sale (customers) point size (px)", 2, 16, key="idle_px")
+        with colz3:
+            st.slider("Suppliers point size (px)", 2, 16, key="supp_px")
+        with colz4:
+            st.toggle("Anti-overlap jitter", key="jitter_on", help="Adds tiny random offsets so nearby points don't overlap.")
+
+        st.selectbox(
+            "Basemap theme",
+            [
+                "Positron (Light, no token)",
+                "Voyager (Labels, no token)",
+                "Mapbox Light (token)",
+                "Mapbox Streets (token)",
+                "Dark Matter (no token)"
+            ],
+            key="theme",
+        )
+
+    # counts toggle (outside the expander) with sticky key
+    st.toggle("Show counts", key="show_all_counts")
+
+    # Read sticky values from session_state
+    show_customers = st.session_state.show_customers
+    show_suppliers = st.session_state.show_suppliers
+    supplier_status_by_period = st.session_state.supplier_status_by_period
+    sold_px = st.session_state.sold_px
+    idle_px = st.session_state.idle_px
+    supp_px = st.session_state.supp_px
+    jitter_on = st.session_state.jitter_on
+    theme = st.session_state.theme
+    show_all_counts = st.session_state.show_all_counts
+
+    # ---- Basemap dict ----
     THEME_URLS = {
         "Positron (Light, no token)": "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
         "Voyager (Labels, no token)": "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
@@ -565,97 +689,229 @@ elif run and st.session_state.nav == "Map":
     style_url = THEME_URLS[theme]
 
     try:
-        # Buyers in selected period (coloring only)
-        inv_period = fetch_invoices(
-            selected_companies, start_date, end_date,
-            include_drafts=False, fields_add=[],
-            user_key=st.session_state.user or ""
-        )
-        buyers_period = set(inv_period["customer"].dropna()) if not inv_period.empty else set()
+        layers = []
+        center_lats, center_lons = [], []
 
-        # All customers with coords
-        cust_df = list_customers()
-        if cust_df.empty:
-            st.info("No customers found."); st.stop()
+        # ================= Customers =================
+        sold_n = nosale_n = 0
+        total_customers = with_coords_c = 0
+        if show_customers:
+            inv_period = fetch_invoices(
+                selected_companies, start_date, end_date,
+                include_drafts=False, fields_add=[],
+                user_key=st.session_state.user or ""
+            )
+            buyers_period = set(inv_period["customer"].dropna()) if not inv_period.empty else set()
 
-        data = cust_df.copy()
-        data["status"] = np.where(data["name"].isin(buyers_period), "Sold (period)", "No sale in period")
-        data.rename(columns={"display_customer": "customer"}, inplace=True)
+            cust_df = list_customers()
+            if not cust_df.empty:
+                data_c = cust_df.copy()
+                data_c["status"] = np.where(data_c["name"].isin(buyers_period), "Sold (period)", "No sale in period")
+                data_c.rename(columns={"display_customer": "customer"}, inplace=True)
 
-        # Counts to help debugging coverage
-        total_customers = len(data)
-        with_coords = int(data.dropna(subset=["custom_lat", "custom_lon"]).shape[0])
+                total_customers = len(data_c)
+                with_coords_c = int(data_c.dropna(subset=["custom_lat","custom_lon"]).shape[0])
 
-        # Keep only rows with valid coordinates
-        plot_df = data.dropna(subset=["custom_lat", "custom_lon"]).copy()
-        if plot_df.empty:
-            st.warning("No customers have coordinates (custom_lat/custom_lon). Add them on Customer records.")
-            st.stop()
+                plot_c = data_c.dropna(subset=["custom_lat","custom_lon"]).copy()
 
-        # Optional: tiny deterministic jitter to reduce overlap (few meters)
-        if jitter_on:
-            def dj(seed):
-                h = abs(hash(str(seed))) % 10_000
-                return (h / 10_000.0 - 0.5) * 0.00005  # ~±0.000025 deg ≈ ±2–3 m
-            plot_df["lat"] = plot_df["custom_lat"] + plot_df["name"].map(dj)
-            plot_df["lon"] = plot_df["custom_lon"] + plot_df["name"].map(lambda x: dj(str(x)+"x"))
-        else:
-            plot_df["lat"] = plot_df["custom_lat"]
-            plot_df["lon"] = plot_df["custom_lon"]
+                # ---- Tooltip-friendly columns ----
+                plot_c["label"] = "Customer: " + plot_c["customer"].fillna(plot_c["name"])
+                if "mobile_no" in plot_c.columns:
+                    plot_c["phone"] = plot_c["mobile_no"].fillna("")
+                else:
+                    plot_c["phone"] = ""
 
-        # KPIs
-        sold_n = int((plot_df["status"] == "Sold (period)").sum())
-        nosale_n = int((plot_df["status"] == "No sale in period").sum())
-        if show_all_counts:
+                if jitter_on:
+                    def dj(seed):
+                        h = abs(hash(str(seed))) % 10_000
+                        return (h / 10_000.0 - 0.5) * 0.00005
+                    plot_c["lat"] = plot_c["custom_lat"] + plot_c["name"].map(dj)
+                    plot_c["lon"] = plot_c["custom_lon"] + plot_c["name"].map(lambda x: dj(str(x)+"x"))
+                else:
+                    plot_c["lat"] = plot_c["custom_lat"]
+                    plot_c["lon"] = plot_c["custom_lon"]
+
+                sold_df = plot_c[plot_c["status"] == "Sold (period)"]
+                idle_df = plot_c[plot_c["status"] == "No sale in period"]
+                sold_n = int(len(sold_df))
+                nosale_n = int(len(idle_df))
+
+                center_lats.extend(plot_c["lat"].tolist())
+                center_lons.extend(plot_c["lon"].tolist())
+
+                import pydeck as pdk
+                # customers layers
+                if not idle_df.empty:
+                    layers.append(pdk.Layer(
+                        "ScatterplotLayer",
+                        data=idle_df,
+                        get_position='[lon, lat]',
+                        get_radius=idle_px,
+                        radius_units="pixels",
+                        radius_min_pixels=idle_px,
+                        radius_max_pixels=idle_px,
+                        stroked=True,
+                        get_line_color=[255,255,255,200],
+                        line_width_min_pixels=1,
+                        pickable=True,
+                        get_fill_color=[160,160,160,160],
+                    ))
+                if not sold_df.empty:
+                    layers.append(pdk.Layer(
+                        "ScatterplotLayer",
+                        data=sold_df,
+                        get_position='[lon, lat]',
+                        get_radius=sold_px,
+                        radius_units="pixels",
+                        radius_min_pixels=sold_px,
+                        radius_max_pixels=sold_px,
+                        stroked=True,
+                        get_line_color=[255,255,255,220],
+                        line_width_min_pixels=1,
+                        pickable=True,
+                        get_fill_color=[0,140,255,200],  # blue
+                    ))
+
+        # ================= Suppliers =================
+        supp_n = supp_active_n = 0
+        total_suppliers = with_coords_s = 0
+        if show_suppliers:
+            # active suppliers (had purchase invoices in period)
+            pinv_period = fetch_purchase_invoices(
+                selected_companies, start_date, end_date,
+                include_drafts=False, user_key=st.session_state.user or ""
+            )
+            active_suppliers = set(pinv_period["supplier"].dropna()) if not pinv_period.empty else set()
+
+            supp_df = list_suppliers()
+            if not supp_df.empty:
+                data_s = supp_df.copy()
+                data_s["status"] = np.where(
+                    data_s["name"].isin(active_suppliers),
+                    "Supplier active (period)",
+                    "Supplier inactive (period)"
+                )
+                data_s.rename(columns={"display_supplier": "supplier"}, inplace=True)
+
+                total_suppliers = len(data_s)
+                with_coords_s = int(data_s.dropna(subset=["custom_lat","custom_lon"]).shape[0])
+
+                plot_s = data_s.dropna(subset=["custom_lat","custom_lon"]).copy()
+
+                # ---- Tooltip-friendly columns ----
+                plot_s["label"] = "Supplier: " + plot_s["supplier"].fillna(plot_s["name"])
+                if "mobile_no" in plot_s.columns:
+                    plot_s["phone"] = plot_s["mobile_no"].fillna("")
+                else:
+                    plot_s["phone"] = ""
+
+                if jitter_on:
+                    def dj(seed):
+                        h = abs(hash("S"+str(seed))) % 10_000
+                        return (h / 10_000.0 - 0.5) * 0.00005
+                    plot_s["lat"] = plot_s["custom_lat"] + plot_s["name"].map(dj)
+                    plot_s["lon"] = plot_s["custom_lon"] + plot_s["name"].map(lambda x: dj(str(x)+"x"))
+                else:
+                    plot_s["lat"] = plot_s["custom_lat"]
+                    plot_s["lon"] = plot_s["custom_lon"]
+
+                import pydeck as pdk
+                if supplier_status_by_period:
+                    active_s = plot_s[plot_s["status"] == "Supplier active (period)"]
+                    inactive_s = plot_s[plot_s["status"] == "Supplier inactive (period)"]
+                    supp_active_n = int(len(active_s))
+                    supp_n = int(len(plot_s))
+
+                    center_lats.extend(plot_s["lat"].tolist())
+                    center_lons.extend(plot_s["lon"].tolist())
+
+                    if not inactive_s.empty:
+                        layers.append(pdk.Layer(
+                            "ScatterplotLayer",
+                            data=inactive_s,
+                            get_position='[lon, lat]',
+                            get_radius=supp_px,
+                            radius_units="pixels",
+                            radius_min_pixels=supp_px,
+                            radius_max_pixels=supp_px,
+                            stroked=True,
+                            get_line_color=[255,255,255,200],
+                            line_width_min_pixels=1,
+                            pickable=True,
+                            get_fill_color=[120,200,120,140],  # light green
+                        ))
+                    if not active_s.empty:
+                        layers.append(pdk.Layer(
+                            "ScatterplotLayer",
+                            data=active_s,
+                            get_position='[lon, lat]',
+                            get_radius=supp_px,
+                            radius_units="pixels",
+                            radius_min_pixels=supp_px,
+                            radius_max_pixels=supp_px,
+                            stroked=True,
+                            get_line_color=[255,255,255,220],
+                            line_width_min_pixels=1,
+                            pickable=True,
+                            get_fill_color=[0,160,70,200],  # green
+                        ))
+                else:
+                    # one uniform supplier layer
+                    supp_n = int(len(plot_s))
+                    center_lats.extend(plot_s["lat"].tolist())
+                    center_lons.extend(plot_s["lon"].tolist())
+
+                    layers.append(pdk.Layer(
+                        "ScatterplotLayer",
+                        data=plot_s,
+                        get_position='[lon, lat]',
+                        get_radius=supp_px,
+                        radius_units="pixels",
+                        radius_min_pixels=supp_px,
+                        radius_max_pixels=supp_px,
+                        stroked=True,
+                        get_line_color=[255,255,255,220],
+                        line_width_min_pixels=1,
+                        pickable=True,
+                        get_fill_color=[0,160,70,200],  # green
+                    ))
+
+        # ================= KPIs =================
+        if st.session_state.show_all_counts:
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total customers (visible to user)", f"{total_customers:,}")
-            c2.metric("Customers with coords", f"{with_coords:,}")
-            c3.metric("With sales (period)", f"{sold_n:,}")
-            c4.metric("No sale (period)", f"{nosale_n:,}")
+            if show_customers:
+                c1.metric("Customers (total / with coords)", f"{(total_customers or 0):,} / {(with_coords_c or 0):,}")
+                c2.metric("Customers (sold / no sale)", f"{(sold_n or 0):,} / {(nosale_n or 0):,}")
+            else:
+                c1.empty(); c2.empty()
+            if show_suppliers:
+                if supplier_status_by_period:
+                    c3.metric("Suppliers (with coords)", f"{(with_coords_s or 0):,}")
+                    c4.metric("Suppliers (active / total)", f"{(supp_active_n or 0):,} / {(supp_n or 0):,}")
+                else:
+                    c3.metric("Suppliers (total / with coords)", f"{(total_suppliers or 0):,} / {(with_coords_s or 0):,}")
+                    c4.metric("Suppliers plotted", f"{(supp_n or 0):,}")
+            else:
+                c3.empty(); c4.empty()
         else:
             c1, c2 = st.columns(2)
-            c1.metric("Customers with sales (period)", f"{sold_n:,}")
-            c2.metric("Customers with no sales (period)", f"{nosale_n:,}")
+            if show_customers:
+                c1.metric("Customers with sales (period)", f"{(sold_n or 0):,}")
+            if show_suppliers:
+                c2.metric(
+                    "Suppliers active (period)" if supplier_status_by_period else "Suppliers plotted",
+                    f"{((supp_active_n if supplier_status_by_period else supp_n) or 0):,}"
+                )
 
-        # Map
+        # ================= Deck & Basemap =================
+        if not center_lats or not center_lons:
+            st.info("No points to plot with current selection.")
+            st.stop()
+
         import pydeck as pdk
-        center_lat = float(plot_df["lat"].mean())
-        center_lon = float(plot_df["lon"].mean())
+        center_lat = float(np.mean(center_lats))
+        center_lon = float(np.mean(center_lons))
 
-        sold_df = plot_df[plot_df["status"] == "Sold (period)"]
-        idle_df = plot_df[plot_df["status"] == "No sale in period"]
-
-        # Pixel-based radii for consistent size across zooms + white outline
-        layer_sold = pdk.Layer(
-            "ScatterplotLayer",
-            data=sold_df,
-            get_position='[lon, lat]',
-            get_radius=sold_px,
-            radius_units="pixels",
-            radius_min_pixels=sold_px,
-            radius_max_pixels=sold_px,
-            stroked=True,
-            get_line_color=[255, 255, 255, 220],
-            line_width_min_pixels=1,
-            pickable=True,
-            get_fill_color=[0, 140, 255, 200],
-        )
-        layer_idle = pdk.Layer(
-            "ScatterplotLayer",
-            data=idle_df,
-            get_position='[lon, lat]',
-            get_radius=idle_px,
-            radius_units="pixels",
-            radius_min_pixels=idle_px,
-            radius_max_pixels=idle_px,
-            stroked=True,
-            get_line_color=[255, 255, 255, 200],
-            line_width_min_pixels=1,
-            pickable=True,
-            get_fill_color=[160, 160, 160, 160],
-        )
-
-        # Modern camera: slight tilt/rotate
         view = pdk.ViewState(
             latitude=center_lat,
             longitude=center_lon,
@@ -665,16 +921,20 @@ elif run and st.session_state.nav == "Map":
             pitch=35,
             bearing=-20,
         )
-        tooltip = {"text": "{customer}\nStatus: {status}"}
+
+        # Upgraded tooltip
+        tooltip = {
+            "html": "<b>{label}</b><br>Status: {status}<br>{phone}",
+            "style": {"backgroundColor": "rgba(20,20,20,0.85)", "color": "white"}
+        }
 
         deck = pdk.Deck(
-            layers=[layer_idle, layer_sold],
+            layers=layers,
             initial_view_state=view,
             tooltip=tooltip,
             parameters={"cull": True},
         )
 
-        # Basemap style selector
         THEME_URLS = {
             "Positron (Light, no token)": "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             "Voyager (Labels, no token)": "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
@@ -683,6 +943,7 @@ elif run and st.session_state.nav == "Map":
             "Mapbox Streets (token)":     "mapbox://styles/mapbox/streets-v12",
         }
         style_url = THEME_URLS[theme]
+
         if style_url.startswith("mapbox://"):
             if MAPBOX_TOKEN:
                 deck.map_style = style_url
@@ -691,14 +952,28 @@ elif run and st.session_state.nav == "Map":
                 st.info("Mapbox token not set; falling back to Positron light basemap.")
                 deck.map_style = THEME_URLS["Positron (Light, no token)"]
         else:
-            deck.map_style = style_url  # CARTO GL JSON, no token needed
+            deck.map_style = style_url
 
         st.pydeck_chart(deck, use_container_width=True)
 
-        with st.expander("Mapped customers (table)"):
-            show_cols = ["customer","status","custom_lat","custom_lon"]
-            st.dataframe(plot_df[show_cols].sort_values(["status","customer"]), use_container_width=True)
-            download_button(plot_df[show_cols], "customers_map.csv", "Download CSV")
+        # Tables
+        with st.expander("📋 Plotted points (tables)"):
+            if 'plot_c' in locals() and show_customers and not plot_c.empty:
+                st.markdown("**Customers**")
+                st.dataframe(
+                    plot_c[["customer","status","custom_lat","custom_lon","phone"]].sort_values(["status","customer"]),
+                    use_container_width=True
+                )
+                download_button(plot_c[["customer","status","custom_lat","custom_lon","phone"]], "map_customers.csv", "Download customers CSV")
+
+            if 'plot_s' in locals() and show_suppliers and not plot_s.empty:
+                st.markdown("**Suppliers**")
+                scols = ["supplier","status","custom_lat","custom_lon","phone"]
+                st.dataframe(
+                    plot_s[scols].sort_values(["status","supplier"]),
+                    use_container_width=True
+                )
+                download_button(plot_s[scols], "map_suppliers.csv", "Download suppliers CSV")
 
     except requests.HTTPError as e:
         st.error("ERPNext API error.")
